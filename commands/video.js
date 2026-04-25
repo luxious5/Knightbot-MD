@@ -1,10 +1,64 @@
 const axios = require('axios');
 const yts = require('yt-search');
-const fs = require('fs');
-const path = require('path');
-const { exec } = require('child_process');
-const util = require('util');
-const execPromise = util.promisify(exec);
+
+const AXIOS_DEFAULTS = {
+    timeout: 60000,
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*'
+    }
+};
+
+async function tryRequest(getter, attempts = 3) {
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+            return await getter();
+        } catch (err) {
+            lastError = err;
+            if (attempt < attempts) {
+                await new Promise(r => setTimeout(r, 1000 * attempt));
+            }
+        }
+    }
+    throw lastError;
+}
+
+// EliteProTech API - Primary
+async function getEliteProTechVideoByUrl(youtubeUrl) {
+    const apiUrl = `https://eliteprotech-apis.zone.id/ytdown?url=${encodeURIComponent(youtubeUrl)}&format=mp4`;
+    const res = await tryRequest(() => axios.get(apiUrl, AXIOS_DEFAULTS));
+    if (res?.data?.success && res?.data?.downloadURL) {
+        return {
+            download: res.data.downloadURL,
+            title: res.data.title
+        };
+    }
+    throw new Error('EliteProTech ytdown returned no download');
+}
+
+async function getYupraVideoByUrl(youtubeUrl) {
+    const apiUrl = `https://api.yupra.my.id/api/downloader/ytmp4?url=${encodeURIComponent(youtubeUrl)}`;
+    const res = await tryRequest(() => axios.get(apiUrl, AXIOS_DEFAULTS));
+    if (res?.data?.success && res?.data?.data?.download_url) {
+        return {
+            download: res.data.data.download_url,
+            title: res.data.data.title,
+            thumbnail: res.data.data.thumbnail
+        };
+    }
+    throw new Error('Yupra returned no download');
+}
+
+async function getOkatsuVideoByUrl(youtubeUrl) {
+    const apiUrl = `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp4?url=${encodeURIComponent(youtubeUrl)}`;
+    const res = await tryRequest(() => axios.get(apiUrl, AXIOS_DEFAULTS));
+    // shape: { status, creator, url, result: { status, title, mp4 } }
+    if (res?.data?.result?.mp4) {
+        return { download: res.data.result.mp4, title: res.data.result.title };
+    }
+    throw new Error('Okatsu ytmp4 returned no mp4');
+}
 
 async function videoCommand(sock, chatId, message) {
     try {
@@ -33,12 +87,21 @@ async function videoCommand(sock, chatId, message) {
             videoUrl = videos[0].url;
             videoTitle = videos[0].title;
             videoThumbnail = videos[0].thumbnail;
-            // Immediately send a message with the video thumbnail, title, and downloading message
-            await sock.sendMessage(chatId, {
-                image: { url: videoThumbnail },
-                caption: `*${videoTitle}*\n\n> _Downloading your video..._`
-            }, { quoted: message });
         }
+
+        // Send thumbnail immediately
+        try {
+            const ytId = (videoUrl.match(/(?:youtu\.be\/|v=)([a-zA-Z0-9_-]{11})/) || [])[1];
+            const thumb = videoThumbnail || (ytId ? `https://i.ytimg.com/vi/${ytId}/sddefault.jpg` : undefined);
+            const captionTitle = videoTitle || searchQuery;
+            if (thumb) {
+                await sock.sendMessage(chatId, {
+                    image: { url: thumb },
+                    caption: `*${captionTitle}*\nDownloading...`
+                }, { quoted: message });
+            }
+        } catch (e) { console.error('[VIDEO] thumb error:', e?.message || e); }
+        
 
         // Validate YouTube URL
         let urls = videoUrl.match(/(?:https?:\/\/)?(?:youtu\.be\/|(?:www\.|m\.)?youtube\.com\/(?:watch\?v=|v\/|embed\/|shorts\/|playlist\?list=)?)([a-zA-Z0-9_-]{11})/gi);
@@ -47,184 +110,69 @@ async function videoCommand(sock, chatId, message) {
             return;
         }
 
-        const apiUrl = `https://api.dreaded.site/api/ytdl/video?url=${encodeURIComponent(videoUrl)}`;
+        // Try multiple APIs with fallback chain: EliteProTech -> Yupra -> Okatsu
+        let videoData;
+        let downloadSuccess = false;
         
-        const response = await axios.get(apiUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'application/json'
-            }
-        });
-
-        if (response.status !== 200) {
-            await sock.sendMessage(chatId, { text: 'Failed to fetch video from the API.' }, { quoted: message });
-            return;
-        }
-
-        const data = response.data;
-
-        if (!data || !data.result || !data.result.download || !data.result.download.url) {
-            await sock.sendMessage(chatId, { text: 'Failed to get a valid download link from the API.' }, { quoted: message });
-            return;
-        }
-
-        const videoDownloadUrl = data.result.download.url;
-        const title = data.result.download.filename || 'video.mp4';
-        const filename = title;
-
-        // Try sending the video directly from the remote URL (like play.js)
-        try {
-            await sock.sendMessage(chatId, {
-                video: { url: videoDownloadUrl },
-                mimetype: 'video/mp4',
-                fileName: filename,
-                caption: `*${title}*\n\n> *_Downloaded by Knight Bot MD_*`
-            }, { quoted: message });
-            return;
-        } catch (directSendErr) {
-            console.log('[video.js] Direct send from URL failed:', directSendErr.message);
-        }
-
-        // If direct send fails, fallback to downloading and converting
-        // Download the video file first
-        const tempDir = path.join(__dirname, '../temp');
-        if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
-        const tempFile = path.join(tempDir, `${Date.now()}.mp4`);
-        const convertedFile = path.join(tempDir, `converted_${Date.now()}.mp4`);
+        // List of API methods to try
+        const apiMethods = [
+            { name: 'EliteProTech', method: () => getEliteProTechVideoByUrl(videoUrl) },
+            { name: 'Yupra', method: () => getYupraVideoByUrl(videoUrl) },
+            { name: 'Okatsu', method: () => getOkatsuVideoByUrl(videoUrl) }
+        ];
         
-        let buffer;
-        let download403 = false;
-        try {
-            const videoRes = await axios.get(videoDownloadUrl, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                    'Referer': 'https://youtube.com/'
-                },
-                responseType: 'arraybuffer'
-            });
-            buffer = Buffer.from(videoRes.data);
-        } catch (err) {
-            if (err.response && err.response.status === 403) {
-                console.log('[video.js] Got 403, trying alternate CDN...');
-                download403 = true;
-            } else {
-                await sock.sendMessage(chatId, { text: 'Failed to download the video file.' }, { quoted: message });
-                return;
-            }
-        }
-        // Fallback: try another CDN if 403
-        if (download403) {
-            let altUrl = videoDownloadUrl.replace(/cdn\d+/, 'cdn404');
+        // Try each API until we successfully get video data
+        for (const apiMethod of apiMethods) {
             try {
-                const videoRes = await axios.get(altUrl, {
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                        'Referer': 'https://youtube.com/'
-                    },
-                    responseType: 'arraybuffer'
-                });
-                buffer = Buffer.from(videoRes.data);
-            } catch (err2) {
-                await sock.sendMessage(chatId, { text: 'Failed to download the video file from alternate CDN.' }, { quoted: message });
-                return;
+                videoData = await apiMethod.method();
+                const videoUrl_check = videoData.download || videoData.dl || videoData.url;
+                
+                if (!videoUrl_check) {
+                    console.log(`${apiMethod.name} returned no download URL, trying next API...`);
+                    continue; // Try next API
+                }
+                
+                downloadSuccess = true;
+                break; // Success! Exit the loop
+            } catch (apiErr) {
+                // API call failed, try next API
+                console.log(`${apiMethod.name} API failed:`, apiErr.message);
+                continue;
             }
-        }
-        if (!buffer || buffer.length < 1024) {
-            await sock.sendMessage(chatId, { text: 'Downloaded file is empty or too small.' }, { quoted: message });
-            return;
         }
         
-        fs.writeFileSync(tempFile, buffer);
-
-        try {
-            // Run ffmpeg and log output
-            try {
-                const { stdout, stderr } = await execPromise(`ffmpeg -i "${tempFile}" -c:v libx264 -c:a aac -preset fast -crf 23 -movflags +faststart "${convertedFile}"`);
-            } catch (ffmpegErr) {
-                throw ffmpegErr;
-            }
-            // Check if conversion was successful
-            if (!fs.existsSync(convertedFile)) {
-                await sock.sendMessage(chatId, { text: 'Converted file missing.' }, { quoted: message });
-                return;
-            }
-            const stats = fs.statSync(convertedFile);
-            const maxSize = 62 * 1024 * 1024; // 62MB
-            if (stats.size > maxSize) {
-                await sock.sendMessage(chatId, { text: 'Video is too large to send on WhatsApp.' }, { quoted: message });
-                return;
-            }
-            // Try sending the converted video
-            try {
-                await sock.sendMessage(chatId, {
-                    video: { url: convertedFile },
-                    mimetype: 'video/mp4',
-                    fileName: filename,
-                    caption: `*${title}*\n\n> *_Downloaded by Knight Bot MD_*`
-                }, { quoted: message });
-            } catch (sendErr) {
-                console.log('[video.js] Send by url failed, trying buffer:', sendErr.message);
-                const videoBuffer = fs.readFileSync(convertedFile);
-                await sock.sendMessage(chatId, {
-                    video: videoBuffer,
-                    mimetype: 'video/mp4',
-                    fileName: filename,
-                    caption: `*${title}*\n\n> *_Downloaded by Knight Bot MD_*`
-                }, { quoted: message });
-            }
-            
-        } catch (conversionError) {
-            console.log('📹 Conversion failed, trying original file:', conversionError.message);
-            try {
-                if (!fs.existsSync(tempFile)) {
-                    await sock.sendMessage(chatId, { text: 'Temp file missing.' }, { quoted: message });
-                    return;
-                }
-                const origStats = fs.statSync(tempFile);
-                const maxSize = 62 * 1024 * 1024; // 62MB
-                if (origStats.size > maxSize) {
-                    await sock.sendMessage(chatId, { text: 'Video is too large to send on WhatsApp.' }, { quoted: message });
-                    return;
-                }
-            } catch {}
-            // Try sending the original file
-            try {
-                await sock.sendMessage(chatId, {
-                    video: { url: tempFile },
-                    mimetype: 'video/mp4',
-                    fileName: filename,
-                    caption: `*${title}*\n\n> *_Downloaded by Knight Bot MD_*`
-                }, { quoted: message });
-            } catch (sendErr2) {
-                console.log('[video.js] Send original by url failed, trying buffer:', sendErr2.message);
-                const videoBuffer = fs.readFileSync(tempFile);
-                await sock.sendMessage(chatId, {
-                    video: videoBuffer,
-                    mimetype: 'video/mp4',
-                    fileName: filename,
-                    caption: `*${title}*\n\n> *_Downloaded by Knight Bot MD_*`
-                }, { quoted: message });
-            }
+        // If all APIs failed, throw error
+        if (!downloadSuccess || !videoData) {
+            throw new Error('All download sources failed. The content may be unavailable or blocked in your region.');
         }
 
-        // Clean up temp files
-        setTimeout(() => {
-            try {
-                if (fs.existsSync(tempFile)) {
-                    fs.unlinkSync(tempFile);
-                }
-                if (fs.existsSync(convertedFile)) {
-                    fs.unlinkSync(convertedFile);
-                }
-            } catch (cleanupErr) {
-                console.log('[video.js] Cleanup error:', cleanupErr.message);
-            }
-        }, 5000);
+        // Send video directly using the download URL
+        await sock.sendMessage(chatId, {
+            video: { url: videoData.download || videoData.dl || videoData.url },
+            mimetype: 'video/mp4',
+            fileName: `${(videoData.title || videoTitle || 'video').replace(/[^\w\s-]/g, '')}.mp4`,
+            caption: `*${videoData.title || videoTitle || 'Video'}*\n\n> *_Downloaded by Knight Bot MD_*`
+        }, { quoted: message });
 
 
     } catch (error) {
-        console.log('📹 Video Command Error:', error.message, error.stack);
-        await sock.sendMessage(chatId, { text: 'Download failed: ' + error.message }, { quoted: message });
+        console.error('[VIDEO] Command Error:', error?.message || error);
+        
+        // Provide more specific error messages
+        let errorMessage = '❌ Failed to download video.';
+        if (error.message && error.message.includes('blocked')) {
+            errorMessage = '❌ Download blocked. The content may be unavailable in your region or due to legal restrictions.';
+        } else if (error.response?.status === 451 || error.status === 451) {
+            errorMessage = '❌ Content unavailable (451). This may be due to legal restrictions or regional blocking.';
+        } else if (error.message && error.message.includes('All download sources failed')) {
+            errorMessage = '❌ All download sources failed. The content may be unavailable or blocked.';
+        } else if (error.message) {
+            errorMessage = '❌ Download failed: ' + error.message;
+        }
+        
+        await sock.sendMessage(chatId, { 
+            text: errorMessage 
+        }, { quoted: message });
     }
 }
 
